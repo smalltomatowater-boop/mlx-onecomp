@@ -128,14 +128,14 @@ mlx_onecomp/
 
 | Feature | Status |
 |---|---|
-| GPTQ core | Working |
-| RTN quantizer | Working |
-| Hessian computation | Working |
-| Block-wise pipeline | Working |
-| Rotation preprocessing | Working |
-| AutoBit (ILP) | Working |
-| LoRA SFT post-process | Working |
-| End-to-end quantization | Working |
+| GPTQ core | Synthetic data verified |
+| RTN quantizer | Synthetic data verified |
+| Hessian computation | GPTQ path verified |
+| Block-wise pipeline | lille-130m tested |
+| Rotation preprocessing | Orthogonality verified |
+| AutoBit (ILP) | lille-130m tested |
+| LoRA SFT post-process | Synthetic data verified |
+| End-to-end quantization | lille-130m tested |
 
 ## Related
 
