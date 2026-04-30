@@ -66,7 +66,7 @@ def _np_quantize(x, scale, zero, maxq):
     return np.clip(np.round(x / scale) + zero, 0, maxq).astype(np.int32)
 
 
-def _np_dequantize(quantized, scale, zero):
+def _np_dequantize(quantized, scale, zero, maxq=None):
     return scale * (quantized.astype(np.float32) - zero)
 
 
