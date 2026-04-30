@@ -6,120 +6,122 @@ Based on [FujitsuResearch/OneCompression](https://github.com/FujitsuResearch/One
 
 ## Why
 
-OneCompression provides state-of-the-art LLM quantization (GPTQ, RTN, QEP), but only works on NVIDIA CUDA. This project ports the core quantization algorithms to Apple Silicon using the MLX framework, enabling:
+OneCompression provides state-of-the-art LLM quantization (GPTQ, RTN, QEP), but only works on NVIDIA CUDA. This project ports the core quantization algorithms to Apple Silicon using the MLX framework.
 
-- **GPTQ quantization** with Hessian-based optimal weight compression
-- **RTN quantization** for fast weight-only compression
-- **Apple Silicon native** — no CUDA dependency
+## Features
 
-## Key Findings from the Port
-
-### 1. MLX Cholesky Support
-
-MLX provides full linear algebra support including `mx.linalg.cholesky` and `mx.linalg.cholesky_inv` — the core operations needed for GPTQ's inverse Hessian computation. However, as of MLX 0.31, Cholesky requires a **CPU stream** (not yet GPU-accelerated):
-
-```python
-L = mx.linalg.cholesky(H, upper=False, stream=mx.cpu)
-```
-
-This is a key finding for anyone attempting similar ports. PyTorch MPS also lacks Cholesky support, making MLX the only viable path on Apple Silicon.
-
-### 2. MLX Array Immutability
-
-MLX arrays are immutable — no in-place assignment (`A[i] = x`). The GPTQ inner loop requires heavy in-place mutation of weight matrices. Solution: **hybrid approach**.
-
-| Component | Framework | Reason |
-|---|---|---|
-| Cholesky decomposition | MLX | Linear algebra via CPU stream |
-| Hessian computation | MLX | Matrix multiplication |
-| GPTQ inner loop | NumPy | Requires in-place mutation |
-| RTN quantization | MLX | Pure functional operations |
-
-### 3. OneCompression CUDA Dependencies
-
-Analysis of the 30+ CUDA references in OneCompression:
-
-- `torch.cuda.empty_cache()` (30+ calls) → **unnecessary** in MLX (unified memory)
-- `device="cuda:0"` defaults → **not needed** (unified memory, no device transfers)
-- `torch.linalg.cholesky` → `mx.linalg.cholesky(stream=mx.cpu)` works
-- `fast_hadamard_transform` (CUDA-only) → needs MLX Metal kernel replacement
-
-## Benchmarks
-
-Tested on real Gemma-4 weights (vision encoder, 4304×1152, bfloat16):
-
-| Method | Bits | MSE | Time |
-|---|---|---|---|
-| RTN | 4-bit | 0.000010 | <0.01s |
-| RTN | 3-bit | 0.000042 | <0.01s |
-| RTN | 2-bit | 0.000222 | <0.01s |
-| GPTQ | 4-bit | 0.000021 | 0.39s |
-| GPTQ | 3-bit | 0.000153 | 0.37s |
-| GPTQ | 2-bit | 0.000768 | 0.38s |
-
-Note: GPTQ uses synthetic Hessian here. With real calibration data, GPTQ significantly outperforms RTN.
+- **Block-wise GPTQ/RTN pipeline** — process transformer blocks sequentially for memory efficiency
+- **Rotation preprocessing** — Hadamard/Random rotation to reduce outliers before quantization
+- **AutoBit** — ILP-based optimal per-layer bit allocation
+- **LoRA fine-tuning** — post-quantization recovery with low-rank adapters
+- **End-to-end pipeline** — `quantize_model()` ties everything together
 
 ## Installation
 
 ```bash
 pip install mlx numpy
-pip install mlx-lm  # optional, for model loading
+pip install mlx-lm  # for model loading
+pip install scipy   # for AutoBit
 ```
 
-## Usage
-
-### RTN Quantization
+## Quick Start
 
 ```python
-import mlx.core as mx
+from mlx_onecomp import quantize_model
+
+result = quantize_model(
+    model_path="mlx-community/lille-130m-instruct-fp16",
+    output_dir="/tmp/quantized",
+    method="rtn",
+    wbits=4,
+)
+print(f"Quantized {result['blockwise']['layers']} layers in {result['total_time']:.1f}s")
+```
+
+### With AutoBit per-layer allocation
+
+```python
+result = quantize_model(
+    model_path="mlx-community/lille-130m-instruct-fp16",
+    output_dir="/tmp/quantized",
+    autobit=True,
+    autobit_target=4.0,
+)
+```
+
+### Standalone components
+
+```python
+# RTN quantizer
 from mlx_onecomp.quantizer.rtn import RTN
+import mlx.core as mx
 
-# Load weight matrix
-weight = mx.load("weights.safetensors")["layer.weight"]
-
-# Quantize to 4-bit with group size 128
 quantizer = RTN(wbits=4, groupsize=128, sym=False)
 result = quantizer.quantize_weight(weight)
 
-print(f"MSE: {result.dequantized_weight}")
-print(f"Scale shape: {result.scale.shape}")
-```
-
-### GPTQ Quantization
-
-```python
-import mlx.core as mx
+# GPTQ
 from mlx_onecomp.quantizer.gptq import run_gptq
 from mlx_onecomp.calibration import compute_hessian
 
-# Get calibration activations (from model forward pass)
-activations = ...  # (num_samples, seq_len, hidden_size)
-
-# Compute Hessian
 hessian = compute_hessian(activations)
+result = run_gptq(hessian=hessian, weight=weight, wbits=4, groupsize=128)
 
-# Run GPTQ
-result = run_gptq(
-    hessian=hessian,
-    weight=layer_weight,
-    wbits=4,
-    groupsize=128,
-    sym=True,
-)
+# Rotation preprocessing
+from mlx_onecomp.preprocessing.rotation import HadamardRotation
+
+rot = HadamardRotation(hidden_size=512)
+rotated_weight = rot.rotate_weight_in(weight)
+
+# AutoBit
+from mlx_onecomp.autobit.profile import sensitivity_profile
+from mlx_onecomp.autobit.solver import solve_bit_allocation
+from mlx_onecomp.autobit.allocator import apply_allocation
+
+profile = sensitivity_profile(model, bits_list=(2, 3, 4, 8))
+layer_sizes = {n: m.weight.shape[0] * m.weight.shape[1]
+               for n, m in model.named_modules()
+               if isinstance(m, nn.Linear)}
+allocation = solve_bit_allocation(profile, layer_sizes, target_avg_bits=4.0)
+apply_allocation(model, allocation)
+
+# LoRA recovery
+from mlx_onecomp.lora_trainer import LoRATrainer
+
+trainer = LoRATrainer(model, rank=8, lora_layers=4)
+trainer.train(dataset, steps=100, lr=1e-4)
+trainer.save_lora("/tmp/lora_weights")
 ```
+
+## Benchmarks
+
+lille-130m (130M params, 24 blocks, FP16):
+
+| Pipeline | Time |
+|---|---|
+| RTN | 2.2s (120 layers) |
+| AutoBit (4.0 bits avg) | 6.9s (profile + solve + apply) |
+| GPTQ | 13.9s |
 
 ## Project Structure
 
 ```
 mlx_onecomp/
+├── __init__.py                   # exports quantize_model
+├── quantize.py                   # End-to-end pipeline
+├── lora_trainer.py               # LoRA fine-tuning
 ├── quantizer/
-│   ├── gptq/_gptq.py      # GPTQ core (Cholesky + quantization loop)
-│   └── rtn/_rtn.py         # RTN quantizer
-├── calibration/
-│   └── calibration.py      # Hessian computation + QEP cross-term
-├── inference.py            # Dequantization utilities
-├── runner.py               # Top-level quantization runner
-└── cli.py                  # CLI entry point
+│   ├── gptq/_gptq.py             # GPTQ core
+│   └── rtn/_rtn.py               # RTN quantizer
+├── pipeline/
+│   └── blockwise.py              # Block-wise processing
+├── preprocessing/
+│   └── rotation.py               # Hadamard/Random rotation
+├── autobit/
+│   ├── profile.py                # Sensitivity profiling
+│   ├── solver.py                 # ILP allocation solver
+│   └── allocator.py              # Apply allocation to model
+├── calibration/                  # Hessian computation
+└── inference.py                  # Dequantization
 ```
 
 ## Status
@@ -129,12 +131,11 @@ mlx_onecomp/
 | GPTQ core | Working |
 | RTN quantizer | Working |
 | Hessian computation | Working |
-| QEP cross-term | Working |
-| Block-wise pipeline | TODO |
-| Rotation preprocessing | TODO |
-| AutoBit (ILP) | TODO |
-| LoRA SFT post-process | TODO |
-| End-to-end model quantization | TODO (needs blockwise pipeline) |
+| Block-wise pipeline | Working |
+| Rotation preprocessing | Working |
+| AutoBit (ILP) | Working |
+| LoRA SFT post-process | Working |
+| End-to-end quantization | Working |
 
 ## Related
 
