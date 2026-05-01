@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import shutil
+import struct
+import tempfile
 import time
 
 import mlx.core as mx
@@ -46,14 +48,87 @@ QUANTIZE_PATTERNS = (
     ".down_proj.weight",
 )
 
-# Non-quantize: cast bfloat16 to float16
-FLOAT_CAST_PATTERNS = (
-    "model.safetensors",
-)
-
 
 def should_quantize(name: str) -> bool:
     return any(name.endswith(s) for s in QUANTIZE_PATTERNS)
+
+
+def _load_bf16_to_fp16(
+    shard_path: str, data_offsets: list, shape: list
+) -> np.ndarray:
+    """Read bfloat16 tensor from safetensors, convert to float16 numpy."""
+    start, end = data_offsets
+    n_bytes = end - start
+    with open(shard_path, "rb") as f:
+        f.seek(start)
+        raw = f.read(n_bytes)
+    u16 = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
+    u32 = u16.astype(np.uint32) << 16
+    return u32.view(np.float32).astype(np.float16)
+
+
+def _get_tensor_info(shard_path: str) -> dict:
+    """Read safetensors header, return {name: (dtype, shape, data_offsets)}."""
+    with open(shard_path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    info = {}
+    for k, v in header.items():
+        if k == "__metadata__":
+            continue
+        info[k] = (v["dtype"], v["shape"], v["data_offsets"])
+    return info
+
+
+def _load_tensor_numpy(shard_path: str, name: str, dtype: str, shape: list,
+                        data_offsets: list) -> np.ndarray:
+    """Load a tensor from safetensors, handling bfloat16."""
+    if dtype == "BF16":
+        return _load_bf16_to_fp16(shard_path, data_offsets, shape)
+    # For fp16/fp32, use safetensors numpy framework
+    with safe_open(shard_path, framework="numpy") as f:
+        return f.get_tensor(name)
+
+
+def _save_safetensors_batch(
+    tensors: dict, path: str
+) -> str:
+    """Save a batch of tensors as a safetensors file (temp file)."""
+    mx.save_safetensors(path, {k: mx.array(v) for k, v in tensors.items()})
+    return path
+
+
+def _merge_safetensors_batches(batch_paths: list, output_path: str):
+    """Merge safetensors batch files into a single output file.
+
+    Uses streaming merge: reads headers for the unified header,
+    then concatenates tensor data without loading into memory.
+    """
+    # Read all headers to build unified header
+    all_tensors = {}
+    for bp in batch_paths:
+        with open(bp, "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+        all_tensors.update(header)
+
+    # Build unified header bytes
+    header_json = json.dumps(all_tensors).encode()
+    header_padded = header_json + b"\x00" * (8 - (len(header_json) % 8))
+    full_header = struct.pack("<Q", len(header_padded)) + header_padded
+
+    # Write merged file
+    with open(output_path, "wb") as out:
+        out.write(full_header)
+        for bp in batch_paths:
+            with open(bp, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                f.read(header_len)  # skip header
+                while True:
+                    chunk = f.read(1024 * 1024)  # 1MB chunks
+                    if not chunk:
+                        break
+                    out.write(chunk)
 
 
 def quantize_tensor(weight: np.ndarray, wbits: int, groupsize: int) -> np.ndarray:
@@ -87,61 +162,78 @@ def quantize_shard(
     quantized = 0
     unchanged = 0
     total_tensors = 0
+    BATCH_SIZE = 50
 
     logger.info("Processing: %s", os.path.basename(shard_path))
 
-    # Open with mmap (lazy loading)
-    with safe_open(shard_path, framework="numpy") as f_in:
-        tensors_to_save = {}
+    # Read tensor metadata from header
+    tensor_info = _get_tensor_info(shard_path)
 
-        for key in f_in.keys():
-            total_tensors += 1
-            logger.debug("[%d] Processing %s", total_tensors, key)
+    # Create temp dir for streaming batch saves
+    batch_dir = tempfile.mkdtemp(prefix="mlx_shard_")
+    batch_paths = []
+    batch = {}
+    batch_idx = 0
 
-            if should_quantize(key):
-                # Load tensor (mmap — only this tensor in memory)
-                weight = f_in.get_tensor(key)
+    def flush_batch():
+        nonlocal batch_idx
+        if not batch:
+            return
+        batch_path = os.path.join(batch_dir, f"batch_{batch_idx:06d}.safetensors")
+        _save_safetensors_batch(batch, batch_path)
+        batch_paths.append(batch_path)
+        batch.clear()
+        batch_idx += 1
+        gc.collect()
 
-                # Apply rotation if applicable
-                if rotation is not None:
-                    rot_type, hidden_sizes = rotation
-                    if weight.ndim == 2 and weight.shape[1] in hidden_sizes:
-                        h = weight.shape[1]
-                        if rot_type == "hadamard":
-                            try:
-                                rot = HadamardRotation(h)
-                            except ValueError:
-                                rot = RandomRotation(h)
-                        else:
+    for key, (dtype, shape, data_offsets) in tensor_info.items():
+        total_tensors += 1
+        logger.debug("[%d] Processing %s", total_tensors, key)
+
+        if should_quantize(key):
+            weight = _load_tensor_numpy(shard_path, key, dtype, shape, data_offsets)
+
+            # Apply rotation if applicable
+            if rotation is not None:
+                rot_type, hidden_sizes = rotation
+                if weight.ndim == 2 and weight.shape[1] in hidden_sizes:
+                    h = weight.shape[1]
+                    if rot_type == "hadamard":
+                        try:
+                            rot = HadamardRotation(h)
+                        except ValueError:
                             rot = RandomRotation(h)
-                        weight = np.array(rot.rotate_weight_in(mx.array(weight)))
+                    else:
+                        rot = RandomRotation(h)
+                    weight = np.array(rot.rotate_weight_in(mx.array(weight)))
 
-                # Determine bits for this layer
-                if allocation is not None:
-                    layer_bits = allocation.get(key, wbits)
-                else:
-                    layer_bits = wbits
-
-                # Quantize
-                dq = quantize_tensor(weight, layer_bits, groupsize)
-                tensors_to_save[key] = dq
-                quantized += 1
+            # Determine bits for this layer
+            if allocation is not None:
+                layer_bits = allocation.get(key, wbits)
             else:
-                # Keep as-is, but cast bfloat16 to float16
-                weight = f_in.get_tensor(key)
-                if str(weight.dtype) == "bfloat16":
-                    tensors_to_save[key] = weight.astype(np.float16)
-                else:
-                    tensors_to_save[key] = weight
-                unchanged += 1
+                layer_bits = wbits
 
-            # Periodic GC every 50 tensors
-            if total_tensors % 50 == 0:
-                gc.collect()
+            # Quantize
+            dq = quantize_tensor(weight, layer_bits, groupsize)
+            batch[key] = dq
+            quantized += 1
+        else:
+            weight = _load_tensor_numpy(shard_path, key, dtype, shape, data_offsets)
+            batch[key] = weight
+            unchanged += 1
 
-        # Save shard
-        logger.info("Saving %d tensors to %s", len(tensors_to_save), output_path)
-        mx.save_safetensors(output_path, {k: mx.array(v) for k, v in tensors_to_save.items()})
+        del weight
+        if total_tensors % BATCH_SIZE == 0:
+            flush_batch()
+
+    flush_batch()
+
+    # Merge all batch files into final output
+    if batch_paths:
+        logger.info("Merging %d batch files → %s", len(batch_paths), output_path)
+        _merge_safetensors_batches(batch_paths, output_path)
+
+    shutil.rmtree(batch_dir, ignore_errors=True)
 
     elapsed = time.time() - t0
     logger.info(
@@ -212,12 +304,10 @@ def quantize_shards(
     rotation_cfg = None
     if rotation is not None:
         hidden_sizes = set()
-        with safe_open(shard_files[0], framework="numpy") as f:
-            for key in f.keys():
-                if should_quantize(key):
-                    w = f.get_tensor(key)
-                    if w.ndim == 2:
-                        hidden_sizes.add(w.shape[1])
+        tensor_info = _get_tensor_info(shard_files[0])
+        for key, (dtype, shape, data_offsets) in tensor_info.items():
+            if should_quantize(key) and len(shape) == 2:
+                hidden_sizes.add(shape[1])
         rotation_cfg = (rotation, hidden_sizes)
         logger.info("Rotation: %s, hidden_sizes: %s", rotation, sorted(hidden_sizes))
 
@@ -229,12 +319,12 @@ def quantize_shards(
 
         profile = {}
         layer_sizes = {}
-        with safe_open(shard_files[0], framework="numpy") as f:
-            for key in f.keys():
-                if should_quantize(key):
-                    weight = f.get_tensor(key)
-                    profile[key] = profile_layer(mx.array(weight), bits_list=(2, 3, 4, 8), groupsize=groupsize)
-                    layer_sizes[key] = weight.shape[0] * weight.shape[1]
+        tensor_info = _get_tensor_info(shard_files[0])
+        for key, (dtype, shape, data_offsets) in tensor_info.items():
+            if should_quantize(key):
+                weight = _load_tensor_numpy(shard_files[0], key, dtype, shape, data_offsets)
+                profile[key] = profile_layer(mx.array(weight), bits_list=(2, 3, 4, 8), groupsize=groupsize)
+                layer_sizes[key] = weight.shape[0] * weight.shape[1]
 
         allocation = solve_bit_allocation(profile, layer_sizes, target_avg_bits=autobit_target)
         logger.info("AutoBit allocation solved in %.1fs", time.time() - t0)
