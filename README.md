@@ -44,6 +44,17 @@ result = quantize_shards(
 print(f"{result['src_size_gb']:.2f}GB → {result['dst_size_gb']:.2f}GB")
 ```
 
+### CLI (one-line)
+
+```bash
+# Multi-shard model (auto-detect) — 2-4GB RAM
+mlx-onecomp /path/to/model -o /path/to/output
+
+# With options
+mlx-onecomp /path/to/model -o /path/to/output --wbits 4 --groupsize 128
+mlx-onecomp /path/to/model -o /path/to/output --wbits 2 --autobit
+```
+
 ### End-to-end pipeline (single-file models)
 
 ```python
@@ -175,6 +186,48 @@ mlx_onecomp/
 - [Issue #7](https://github.com/FujitsuResearch/OneCompression/issues/7) — Apple Silicon / MPS support request
 - [Apple MLX](https://github.com/ml-explore/mlx) — MLX framework
 
+## CLI
+
+```bash
+# Multi-shard model (auto-detect) — 2-4GB RAM
+mlx-onecomp /path/to/model -o /path/to/output
+
+# With options
+mlx-onecomp /path/to/model -o /path/to/output --wbits 4 --groupsize 128
+mlx-onecomp /path/to/model -o /path/to/output --wbits 3
+mlx-onecomp /path/to/model -o /path/to/output --wbits 2 --autobit
+```
+
 ## License
 
 MIT License. Based on FujitsuResearch/OneCompression (MIT, Copyright 2025-2026 Fujitsu Ltd.).
+
+## 日本語
+
+[FujitsuResearch/OneCompression](https://github.com/FujitsuResearch/OneCompression)はNVIDIA CUDA版のみ提供されている高品質LLM量子化ライブラリです。このプロジェクトはApple Silicon向けにMLXへ移植したものです。
+
+**主な特徴：**
+- シェード単位の量子化 — 2-4GBのRAMで大容量モデルに対応（4bitパックint4）
+- ブロック単位のGPTQ/RTN — メモリ効率のよい変換
+- AutoBit — ILPによるレイヤーごとの最適ビット割り当て
+- LoRA — 量子化後の微調整による品質回復
+
+### クイックスタート
+
+```bash
+# 量子化（multi-shardモデルを自動検知）
+mlx-onecomp /path/to/model -o /path/to/output
+
+# ビット数指定（2/3/4/8bitから選択）
+mlx-onecomp /path/to/model -o /path/to/output --wbits 4
+
+# AutoBit（レイヤーごとに2-8bitを自動最適化）
+mlx-onecomp /path/to/model -o /path/to/output --wbits 2 --autobit
+```
+
+### 実証テスト結果
+
+| モデル | 量子化 | 圧縮前 | 圧縮後 | 時間 |
+|---|---|---|---|---|
+| Gemma-4 31B | 4-bit RTN | 58.25GB | 18.19GB | 25.6分 |
+| lille-130m | RTN | - | - | 2.2秒 |
