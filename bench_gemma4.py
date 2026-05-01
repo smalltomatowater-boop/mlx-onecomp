@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from mlx_onecomp.quantize_shard import quantize_shards
 
 SRC_DIR = "/Volumes/LLM_MODEL/gemma4-31B-heretic-uncensored-fp16"
-DST_DIR = "/Volumes/ssd128g/gemma4-quantized"
+DST_DIR = "/Volumes/LLM_MODEL/gemma4-quantized"
 
 
 if __name__ == "__main__":

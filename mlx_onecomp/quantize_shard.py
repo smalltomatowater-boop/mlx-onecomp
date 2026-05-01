@@ -131,27 +131,30 @@ def _merge_safetensors_batches(batch_paths: list, output_path: str):
                     out.write(chunk)
 
 
-def _pack_int4_to_uint8(q_int: np.ndarray) -> np.ndarray:
-    """Pack int4 values (0-15) into uint8 (2 values per byte).
+def _pack_int4_to_uint32(q_int: np.ndarray) -> np.ndarray:
+    """Pack int4 values (0-15) into uint32 (8 values per uint32).
+
+    Matches MLX's mx.quantize output format for safetensors.
 
     Input shape: (out_features, in_features) with values in [0, 15].
-    Output shape: (out_features, in_features // 2) as uint8.
+    Output shape: (out_features, in_features // 8) as uint32.
     """
-    assert q_int.shape[-1] % 2 == 0, "in_features must be divisible by 2 for packing"
-    reshaped = q_int.reshape(-1, 2)
-    lo = reshaped[:, 0].astype(np.uint8)
-    hi = reshaped[:, 1].astype(np.uint8)
-    packed = (lo | (hi << 4)).reshape(q_int.shape[0], q_int.shape[1] // 2)
-    return packed
+    assert q_int.shape[-1] % 8 == 0, \
+        f"in_features ({q_int.shape[-1]}) must be divisible by 8"
+    reshaped = q_int.reshape(-1, 8).astype(np.uint32)
+    packed = np.zeros(reshaped.shape[:-1], dtype=np.uint32)
+    for i in range(8):
+        packed |= (reshaped[:, i] << (4 * i))
+    return packed.reshape(q_int.shape[0], q_int.shape[1] // 8)
 
 
 def quantize_tensor(weight: np.ndarray, wbits: int, groupsize: int) -> dict:
     """Quantize a single numpy weight tensor using RTN.
 
-    Returns dict with:
-        weight: packed uint8 (2 int4 values per byte)
-        scales: fp16 scale tensor
-        zeros: fp16 zero-point tensor
+    Returns dict compatible with MLX QuantizedLinear format:
+        weight: uint32 packed quantized values
+        scales: float32 scale tensor
+        biases: float32 zero-point tensor (MLX calls them biases)
         wbits: bits per value
         groupsize: group size used
     """
@@ -160,15 +163,15 @@ def quantize_tensor(weight: np.ndarray, wbits: int, groupsize: int) -> dict:
     result = quantizer.quantize_weight(w_mx)
 
     q_int = np.array(result.quantized_weight)
-    scales = np.array(result.scale.astype(mx.float16))
-    zeros = np.array(result.zero.astype(mx.float16))
+    scales = np.array(result.scale.astype(mx.float32))
+    biases = np.array(result.zero.astype(mx.float32))
 
-    packed = _pack_int4_to_uint8(q_int)
+    packed = _pack_int4_to_uint32(q_int)
 
     return {
         "weight": packed,
         "scales": scales,
-        "zeros": zeros,
+        "biases": biases,
         "wbits": wbits,
         "groupsize": groupsize,
     }
@@ -249,11 +252,14 @@ def quantize_shard(
             else:
                 layer_bits = wbits
 
-            # Quantize and save as separate tensors
+            # Quantize and save in MLX QuantizedLinear format
             qresult = quantize_tensor(weight, layer_bits, groupsize)
-            batch[f"{key}.weight"] = qresult["weight"]
-            batch[f"{key}.scales"] = qresult["scales"]
-            batch[f"{key}.zeros"] = qresult["zeros"]
+            # key already ends with ".weight" — use it directly for the weight tensor
+            batch[key] = qresult["weight"]
+            # For scales/biases: strip ".weight" suffix and add the right suffix
+            base = key[:-7]  # e.g. "...mlp.down_proj"
+            batch[f"{base}.scales"] = qresult["scales"]
+            batch[f"{base}.biases"] = qresult["biases"]
             quantized += 1
         else:
             weight = _load_tensor_numpy(shard_path, key, dtype, shape, data_offsets)
@@ -401,6 +407,22 @@ def quantize_shards(
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(dst_dir, f))
             logger.info("Copied %s", f)
+
+    # Update config.json with quantization metadata for MLX compatibility
+    config_path = os.path.join(dst_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        quant_config = {
+            "group_size": groupsize,
+            "bits": wbits,
+            "mode": "affine",
+        }
+        config["quantization"] = quant_config
+        config["quantization_config"] = quant_config
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        logger.info("Updated config.json with quantization metadata")
 
     results["shards"] = shard_results
     results["total_time"] = time.time() - t_start
