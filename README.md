@@ -10,6 +10,7 @@ OneCompression provides state-of-the-art LLM quantization (GPTQ, RTN, QEP), but 
 
 ## Features
 
+- **Shard-based quantization** — process multi-shard models with 2-4GB RAM (RTN, 4-bit packed int4)
 - **Block-wise GPTQ/RTN pipeline** — process transformer blocks sequentially for memory efficiency
 - **Rotation preprocessing** — Hadamard/Random rotation to reduce outliers before quantization
 - **AutoBit** — ILP-based optimal per-layer bit allocation
@@ -19,12 +20,31 @@ OneCompression provides state-of-the-art LLM quantization (GPTQ, RTN, QEP), but 
 ## Installation
 
 ```bash
-pip install mlx numpy
+pip install mlx numpy safetensors
 pip install mlx-lm  # for model loading
 pip install scipy   # for AutoBit
 ```
 
 ## Quick Start
+
+### Shard-based quantization (low RAM, large models)
+
+Process multi-shard safetensors models with just 2-4GB RAM:
+
+```python
+from mlx_onecomp.quantize_shard import quantize_shards
+
+result = quantize_shards(
+    src_dir="/path/to/model",
+    dst_dir="/path/to/output",
+    method="rtn",
+    wbits=4,
+    groupsize=128,
+)
+print(f"{result['src_size_gb']:.2f}GB → {result['dst_size_gb']:.2f}GB")
+```
+
+### End-to-end pipeline (single-file models)
 
 ```python
 from mlx_onecomp import quantize_model
@@ -94,7 +114,7 @@ trainer.save_lora("/tmp/lora_weights")
 
 ## Benchmarks
 
-lille-130m (130M params, 24 blocks, FP16):
+### lille-130m (130M params, 24 blocks, FP16)
 
 | Pipeline | Time |
 |---|---|
@@ -102,12 +122,23 @@ lille-130m (130M params, 24 blocks, FP16):
 | AutoBit (4.0 bits avg) | 6.9s (profile + solve + apply) |
 | GPTQ | 13.9s |
 
+### Gemma-4 31B (Shard-based RTN, 4-bit packed int4)
+
+| Metric | Value |
+|---|---|
+| Source size | 58.25 GB (FP16) |
+| Output size | 18.19 GB (4-bit RTN) |
+| Compression | 31.2% (3.2x smaller) |
+| Total time | 25.6 min (410 layers) |
+| Peak RAM | ~2-4 GB per shard |
+
 ## Project Structure
 
 ```
 mlx_onecomp/
 ├── __init__.py                   # exports quantize_model
 ├── quantize.py                   # End-to-end pipeline
+├── quantize_shard.py             # Shard-based quantization (low RAM)
 ├── lora_trainer.py               # LoRA fine-tuning
 ├── quantizer/
 │   ├── gptq/_gptq.py             # GPTQ core
@@ -128,6 +159,7 @@ mlx_onecomp/
 
 | Feature | Status |
 |---|---|
+| Shard quantization (packed int4) | Gemma-4 31B tested |
 | GPTQ core | Synthetic data verified |
 | RTN quantizer | Synthetic data verified |
 | Hessian computation | GPTQ path verified |
