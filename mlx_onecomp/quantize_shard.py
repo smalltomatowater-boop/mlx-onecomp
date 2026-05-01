@@ -131,13 +131,47 @@ def _merge_safetensors_batches(batch_paths: list, output_path: str):
                     out.write(chunk)
 
 
-def quantize_tensor(weight: np.ndarray, wbits: int, groupsize: int) -> np.ndarray:
-    """Quantize a single numpy weight tensor using RTN, return dequantized numpy."""
+def _pack_int4_to_uint8(q_int: np.ndarray) -> np.ndarray:
+    """Pack int4 values (0-15) into uint8 (2 values per byte).
+
+    Input shape: (out_features, in_features) with values in [0, 15].
+    Output shape: (out_features, in_features // 2) as uint8.
+    """
+    assert q_int.shape[-1] % 2 == 0, "in_features must be divisible by 2 for packing"
+    reshaped = q_int.reshape(-1, 2)
+    lo = reshaped[:, 0].astype(np.uint8)
+    hi = reshaped[:, 1].astype(np.uint8)
+    packed = (lo | (hi << 4)).reshape(q_int.shape[0], q_int.shape[1] // 2)
+    return packed
+
+
+def quantize_tensor(weight: np.ndarray, wbits: int, groupsize: int) -> dict:
+    """Quantize a single numpy weight tensor using RTN.
+
+    Returns dict with:
+        weight: packed uint8 (2 int4 values per byte)
+        scales: fp16 scale tensor
+        zeros: fp16 zero-point tensor
+        wbits: bits per value
+        groupsize: group size used
+    """
     w_mx = mx.array(weight.astype(np.float32))
     quantizer = RTN(wbits=wbits, groupsize=groupsize, sym=False)
     result = quantizer.quantize_weight(w_mx)
-    dq_mx = result.dequantized_weight
-    return np.array(dq_mx.astype(mx.float16))
+
+    q_int = np.array(result.quantized_weight)
+    scales = np.array(result.scale.astype(mx.float16))
+    zeros = np.array(result.zero.astype(mx.float16))
+
+    packed = _pack_int4_to_uint8(q_int)
+
+    return {
+        "weight": packed,
+        "scales": scales,
+        "zeros": zeros,
+        "wbits": wbits,
+        "groupsize": groupsize,
+    }
 
 
 def quantize_shard(
@@ -162,15 +196,17 @@ def quantize_shard(
     quantized = 0
     unchanged = 0
     total_tensors = 0
-    BATCH_SIZE = 50
+    BATCH_SIZE = 20
 
     logger.info("Processing: %s", os.path.basename(shard_path))
 
     # Read tensor metadata from header
     tensor_info = _get_tensor_info(shard_path)
 
-    # Create temp dir for streaming batch saves
-    batch_dir = tempfile.mkdtemp(prefix="mlx_shard_")
+    # Create temp dir for streaming batch saves (use TMPDIR env var, falls back to output dir)
+    output_dir = os.path.dirname(output_path) or "."
+    temp_base = os.environ.get("MLX_TEMP_DIR") or output_dir
+    batch_dir = tempfile.mkdtemp(prefix="mlx_shard_", dir=temp_base)
     batch_paths = []
     batch = {}
     batch_idx = 0
@@ -213,9 +249,11 @@ def quantize_shard(
             else:
                 layer_bits = wbits
 
-            # Quantize
-            dq = quantize_tensor(weight, layer_bits, groupsize)
-            batch[key] = dq
+            # Quantize and save as separate tensors
+            qresult = quantize_tensor(weight, layer_bits, groupsize)
+            batch[f"{key}.weight"] = qresult["weight"]
+            batch[f"{key}.scales"] = qresult["scales"]
+            batch[f"{key}.zeros"] = qresult["zeros"]
             quantized += 1
         else:
             weight = _load_tensor_numpy(shard_path, key, dtype, shape, data_offsets)
@@ -233,6 +271,7 @@ def quantize_shard(
         logger.info("Merging %d batch files → %s", len(batch_paths), output_path)
         _merge_safetensors_batches(batch_paths, output_path)
 
+    # Clean up temp dir (in output dir)
     shutil.rmtree(batch_dir, ignore_errors=True)
 
     elapsed = time.time() - t0
