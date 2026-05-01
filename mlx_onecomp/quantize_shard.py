@@ -104,18 +104,29 @@ def _merge_safetensors_batches(batch_paths: list, output_path: str):
     Uses streaming merge: reads headers for the unified header,
     then concatenates tensor data without loading into memory.
     """
-    # Read all headers to build unified header
+    # Read all headers to build unified header, adjusting offsets
     all_tensors = {}
+    data_offset = 0
     for bp in batch_paths:
         with open(bp, "rb") as f:
             header_len = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(header_len))
-        all_tensors.update(header)
+        # Adjust data offsets
+        for key, value in header.items():
+            if key == "__metadata__":
+                continue
+            offsets = list(value["data_offsets"])
+            offsets[0] += data_offset
+            offsets[1] += data_offset
+            value["data_offsets"] = offsets
+            all_tensors[key] = value
+        # Track data size of this batch
+        data_size = os.path.getsize(bp) - 8 - header_len
+        data_offset += data_size
 
-    # Build unified header bytes
-    header_json = json.dumps(all_tensors).encode()
-    header_padded = header_json + b"\x00" * (8 - (len(header_json) % 8))
-    full_header = struct.pack("<Q", len(header_padded)) + header_padded
+    # Build unified header bytes (compact format, matches safetensors)
+    header_json = json.dumps(all_tensors, separators=(",", ":")).encode()
+    full_header = struct.pack("<Q", len(header_json)) + header_json
 
     # Write merged file
     with open(output_path, "wb") as out:
