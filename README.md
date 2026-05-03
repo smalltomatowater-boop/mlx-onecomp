@@ -133,15 +133,17 @@ trainer.save_lora("/tmp/lora_weights")
 | AutoBit (4.0 bits avg) | 6.9s (profile + solve + apply) |
 | GPTQ | 13.9s |
 
-### Gemma-4 31B (Shard-based RTN, 4-bit packed int4)
+### Gemma-4 31B (Shard-based RTN, 4-bit + 8-bit attn)
 
 | Metric | Value |
 |---|---|
-| Source size | 58.25 GB (FP16) |
-| Output size | 18.19 GB (4-bit RTN) |
-| Compression | 31.2% (3.2x smaller) |
-| Total time | 25.6 min (410 layers) |
-| Peak RAM | ~2-4 GB per shard |
+| Source size | 58.25 GB (BF16) |
+| Output size | 24.75 GB (4-bit MLP + 8-bit KVO) |
+| Compression | 42.5% (2.35x smaller) |
+| Total time | 33.5 min (410 quantized layers) |
+| Peak RAM | ~5 GB |
+| Inference quality | logits std=4.92 (original: 4.63) |
+| Text generation | Working (mlx-lm verified) |
 
 ## Project Structure
 
@@ -170,7 +172,7 @@ mlx_onecomp/
 
 | Feature | Status |
 |---|---|
-| Shard quantization (packed int4) | Gemma-4 31B tested |
+| Shard quantization (packed int4) | Gemma-4 31B tested, inference verified |
 | GPTQ core | Synthetic data verified |
 | RTN quantizer | Synthetic data verified |
 | Hessian computation | GPTQ path verified |
@@ -229,5 +231,5 @@ mlx-onecomp /path/to/model -o /path/to/output --wbits 2 --autobit
 
 | モデル | 量子化 | 圧縮前 | 圧縮後 | 時間 |
 |---|---|---|---|---|
-| Gemma-4 31B | 4-bit RTN | 58.25GB | 18.19GB | 25.6分 |
+| Gemma-4 31B | 4-bit RTN + 8-bit attn | 58.25GB | 24.75GB | 33.5分 |
 | lille-130m | RTN | - | - | 2.2秒 |
